@@ -1,0 +1,143 @@
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from flask import Flask, request, jsonify
+import requests
+
+# --- Basic Configuration ---
+app = Flask(__name__)
+
+# Load environment variables
+# For local development, you can use a .env file with python-dotenv,
+# but for Render, we set these in the dashboard.
+SECRET_KEY = os.getenv('SHAIKHbmwe@30')
+TELEGRAM_BOT_TOKEN = os.getenv('8329584711: AAE8eK_mKUNnuoE02dzZxuXWIBP
+OwBshtBM')
+TELEGRAM_CHAT_ID = os.getenv('5123284960')
+
+# --- Pre-flight Checks ---
+# Ensure all required environment variables are set
+if not all([SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    error_message = "CRITICAL: Missing one or more required environment variables (SECRET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)."
+    print(error_message) # Print to console for server logs
+    # In a real-world scenario, you might want to exit or prevent the app from starting.
+    # For simplicity in deployment, we log the error. The endpoints will fail gracefully.
+
+# --- Logging Configuration ---
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_file = 'app.log'
+
+# Use a rotating file handler to prevent log files from growing indefinitely
+# 1MB per file, keeping the last 5 logs.
+file_handler = RotatingFileHandler(log_file, maxBytes=1024 * 1024, backupCount=5)
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Also log to console
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(log_formatter)
+stream_handler.setLevel(logging.INFO)
+
+# Get the root logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
+
+# --- Helper Function ---
+def send_telegram_message(message):
+    """
+    Sends a formatted message to the configured Telegram chat.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram credentials are not set. Cannot send message.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'Markdown'
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()  # Will raise an HTTPError for bad responses (4xx or 5xx)
+        logger.info(f"Successfully sent message to Telegram. Response: {response.json()}")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to send message to Telegram: {e}")
+        return False
+
+# --- Flask Routes ---
+@app.route('/')
+def index():
+    """A simple health check endpoint."""
+    return "<h1>Webhook server is running.</h1><p>Listening for TradingView alerts...</p>", 200
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    The main webhook endpoint that receives alerts from TradingView.
+    """
+    logger.info("Received a request on /webhook.")
+
+    # 1. Authentication
+    if not SECRET_KEY:
+        logger.critical("SECRET_KEY is not configured on the server.")
+        return jsonify({"status": "error", "message": "Internal server configuration error"}), 500
+
+    try:
+        data = request.get_json()
+        if not data:
+            logger.warning("Received request with no JSON payload.")
+            return jsonify({"status": "error", "message": "Invalid JSON payload"}), 400
+    except Exception as e:
+        logger.error(f"Could not parse JSON payload: {e}")
+        return jsonify({"status": "error", "message": "Could not parse JSON payload"}), 400
+
+    received_secret = data.get('secret')
+    if received_secret != SECRET_KEY:
+        logger.warning(f"Authentication failed. Invalid secret key received from {request.remote_addr}.")
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    logger.info("Authentication successful.")
+
+    # 2. Payload Parsing & Message Formatting
+    try:
+        strategy_msg = data.get('message', 'N/A')
+        action = str(data.get('action', 'N/A')).upper()
+        ticker = data.get('ticker', 'N/A')
+        timeframe = data.get('timeframe', 'N/A')
+        price = float(data.get('price', 0.0))
+        
+        # Format the price with commas and appropriate decimal places
+        formatted_price = f"${price:,.4f}" if price < 1 else f"${price:,.2f}"
+
+        # Get current time for the message
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Create the final message for Telegram
+        message_to_send = (
+            f"🚀 **Trading Signal Alert** 🚀\n\n"
+            f"**Strategy:** {strategy_msg}\n"
+            f"**Action:** {action}\n"
+            f"**Ticker:** {ticker}\n"
+            f"**Timeframe:** {timeframe}\n"
+            f"**Price:** {formatted_price}\n"
+            f"**Time:** {timestamp}"
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error parsing payload data: {e}. Payload was: {data}")
+        return jsonify({"status": "error", "message": "Malformed payload data"}), 400
+
+    # 3. Notification System
+    if send_telegram_message(message_to_send):
+        return jsonify({"status": "success", "message": "Alert forwarded to Telegram"}), 200
+    else:
+        return jsonify({"status": "error", "message": "Failed to forward alert to Telegram"}), 500
+
+if __name__ == '__main__':
+    # This is for local development only.
+    # For deployment, a WSGI server like Gunicorn will be used.
+    app.run(host='0.0.0.0', port=5001, debug=True)
